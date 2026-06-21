@@ -148,7 +148,7 @@ Escolha uma opção: 2
   Alterar HORA
 =============================================
 
-Quantas horas (+1, -1)? +3
+Quantas horas (+1, -1)? +1
 
 O que deseja processar?
   [1] Diretório inteiro (busca recursiva)
@@ -156,28 +156,43 @@ O que deseja processar?
 Escolha [1/2]: 1
 Caminho do diretório: /Volumes/Media_Dock/2026-06-Viagem
 
-Encontrados 142 arquivo(s):
-  - 98 JPG
-  - 12 HEIC
-  - 20 DNG
-  - 12 MOV
+Encontrados 3 arquivo(s):
+  - 2 JPG
+  - 1 MOV
 
 Executar em modo simulação (não altera nada)? [s/N]: n
 Manter backups dos arquivos originais (recomendado)? [S/n]:
 
 Resumo da operação:
-  Ajuste: +3 horas (total: +3 horas)
-  Arquivos: 142
+  Ajuste: +1 horas (total: +1 horas)
+  Arquivos: 3
   Modo: APLICAR ALTERAÇÕES
   Backups: sim
 
 Confirma a operação? [s/N]: s
-100%|████████████████████████████| 142/142 [00:18<00:00, 7.7arquivo/s]
+✓ IMG_0001.JPG  (2026-06-21 11:45:00 -> 2026-06-21 12:45:00)
+✓ IMG_0002.JPG  (2026-06-21 11:47:12 -> 2026-06-21 12:47:12)
+✓ VID_0001.MOV  (2026-06-21 11:50:00 -> 2026-06-21 12:50:00)
+100%|████████████████████████████| 3/3 [00:01<00:00, 2.4arquivo/s]
 
-Concluído: 142 sucesso(s), 0 erro(s).
+Concluído: 3 sucesso(s), 0 erro(s).
 
 Pressione ENTER para voltar ao menu...
 ```
+
+Repare na linha de cada arquivo: ela mostra a hora **lida do próprio
+arquivo antes do ajuste** e a hora **resultante**, então dá para
+conferir na hora se o resultado bate com o esperado — sem precisar abrir
+o Finder ou o Photos depois.
+
+> **Atenção — o ajuste é cumulativo:** cada execução soma o
+> deslocamento em cima do que já está gravado no arquivo. Se você rodar
+> `+1` hora duas vezes no mesmo arquivo (por exemplo, testando de novo
+> sem perceber que já tinha aplicado antes), o resultado final será
+> `+2` horas em relação à data original — e não é um bug, é exatamente
+> como um "shift" relativo deve funcionar. Se quiser desfazer um teste,
+> restaure a partir do arquivo de backup (`arquivo.jpg_original`) antes
+> de tentar de novo.
 
 ## Removendo os backups depois de conferir o resultado
 

@@ -20,9 +20,10 @@ O programa é deliberadamente um único arquivo Python, dividido em três
 camadas:
 
 1. **Funções puras** (`parse_signed_int_offset`, `build_exiftool_shift_expr`,
-   `parse_exiftool_datetime`, `discover_files_in_directory`,
-   `resolve_specific_files`, `summarize_extensions`) — sem efeitos
-   colaterais, fáceis de testar isoladamente com `pytest`.
+   `parse_exiftool_datetime`, `format_shift_line`,
+   `discover_files_in_directory`, `resolve_specific_files`,
+   `summarize_extensions`) — sem efeitos colaterais, fáceis de testar
+   isoladamente com `pytest`.
 2. **Funções de I/O / efeito colateral** (`read_primary_datetime`,
    `shift_exif_metadata`, `sync_filesystem_dates_to`,
    `shift_filesystem_dates_relative`) — dependem de processos externos
@@ -182,6 +183,51 @@ programa usa o utilitário `SetFile -d`, das **Xcode Command Line
 Tools**. Se não estiver instalado, o programa detecta isso no início
 (`shutil.which("SetFile")`) e segue normalmente, apenas avisando que a
 data de criação não será alterada.
+
+## Natureza cumulativa do shift (importante para depuração)
+
+O `exiftool` (e, por extensão, este programa) faz um deslocamento
+**relativo**, não define um valor absoluto. Isso significa que rodar o
+programa duas vezes no mesmo arquivo com `+1` hora produz `+2` horas em
+relação ao valor original — cada execução soma em cima do que já está
+gravado, não em cima de um "original" lembrado externamente.
+
+Isso foi confirmado empiricamente (instalando `exiftool`/`ffmpeg` num
+ambiente de teste e rodando `process_files` duas vezes seguidas no
+mesmo arquivo): a primeira chamada levou `11:45 → 12:45` corretamente;
+chamando de novo no mesmo arquivo, sem restaurar o backup, levou
+`12:45 → 13:45` — um total de `+2h` em relação ao `11:45` original, que
+é o comportamento correto e esperado de um shift relativo, mas pode
+parecer um bug se o usuário não perceber que já tinha rodado antes (por
+exemplo, testando a mesma pasta em duas versões diferentes do script,
+ou voltando ao menu e repetindo a operação sem querer).
+
+Para tornar isso visível e evitar essa confusão, cada arquivo agora
+imprime o **antes e depois** durante o processamento (e também no modo
+simulação, já que `read_primary_datetime` é chamada antes de decidir se
+vai escrever):
+
+```python
+def format_shift_line(file_path, original_dt, new_dt) -> str:
+    if original_dt is None:
+        return f"{file_path}  (sem data EXIF; sistema de arquivos deslocado pelo mtime anterior)"
+    fmt = "%Y-%m-%d %H:%M:%S"
+    return f"{file_path}  ({original_dt.strftime(fmt)} -> {new_dt.strftime(fmt)})"
+```
+
+```
+✓ IMG_0001.JPG  (2026-06-21 11:45:00 -> 2026-06-21 12:45:00)
+```
+
+`log_line()` usa `tqdm.write()` (em vez de `print()`) quando a barra de
+progresso está ativa, para a linha não quebrar o desenho da barra no
+terminal.
+
+Se o resultado mostrado parecer "dobrado" em relação ao esperado, a
+causa mais provável é justamente essa: o arquivo já tinha sido alterado
+numa execução anterior. Para zerar e testar de novo, restaure o backup
+(`arquivo.jpg_original`, criado automaticamente quando "Manter backups"
+está ativado) antes de rodar de novo.
 
 ## Tratamento de erros e segurança
 

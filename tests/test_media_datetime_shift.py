@@ -18,6 +18,7 @@ import pytest
 from media_datetime_shift import (
     MENU_OPTIONS,
     build_exiftool_shift_expr,
+    format_shift_line,
     parse_exiftool_datetime,
     parse_signed_int_offset,
     process_files,
@@ -71,6 +72,47 @@ class TestParseExiftoolDatetime:
 
     def test_strips_whitespace(self):
         assert parse_exiftool_datetime("  2026:06:21 11:45:00  ") == datetime(2026, 6, 21, 11, 45, 0)
+
+
+class TestFormatShiftLine:
+    def test_shows_before_and_after(self):
+        line = format_shift_line(
+            "/tmp/foto.jpg",
+            datetime(2026, 6, 21, 11, 45, 0),
+            datetime(2026, 6, 21, 12, 45, 0),
+        )
+        assert "2026-06-21 11:45:00" in line
+        assert "2026-06-21 12:45:00" in line
+        assert "/tmp/foto.jpg" in line
+
+    def test_no_exif_date_shows_warning_text(self):
+        line = format_shift_line("/tmp/sem_data.jpg", None, None)
+        assert "sem data EXIF" in line
+
+
+class TestProcessFilesDryRunDoesNotWrite:
+    """Modo simulação deve ler a data (para mostrar o preview), mas
+    NUNCA chamar as funções que de fato escrevem no arquivo."""
+
+    def test_dry_run_never_writes(self, tmp_path):
+        jpg = tmp_path / "foto.jpg"
+        jpg.write_bytes(b"\xff\xd8\xff")
+
+        with patch(
+            "media_datetime_shift.read_primary_datetime",
+            return_value=datetime(2026, 6, 21, 11, 45, 0),
+        ), patch(
+            "media_datetime_shift.shift_exif_metadata"
+        ) as mock_shift_exif, patch(
+            "media_datetime_shift.sync_filesystem_dates_to"
+        ) as mock_sync, patch(
+            "media_datetime_shift.shift_filesystem_dates_relative"
+        ) as mock_relative:
+            process_files([str(jpg)], total_hours=1, dry_run=True, keep_backup=True, has_setfile=False)
+
+        mock_shift_exif.assert_not_called()
+        mock_sync.assert_not_called()
+        mock_relative.assert_not_called()
 
 
 class TestProcessFilesUsesExifDateNotStaleMtime:

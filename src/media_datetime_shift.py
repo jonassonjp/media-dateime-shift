@@ -364,32 +364,52 @@ def confirm(prompt: str, default_yes: bool = False) -> bool:
     return raw == "s"
 
 
+def format_shift_line(file_path: str, original_dt, new_dt) -> str:
+    """Monta a linha de log mostrando claramente o antes/depois de um
+    arquivo. Função pura, fácil de testar sem subprocess/exiftool.
+    """
+    if original_dt is None:
+        return f"{file_path}  (sem data EXIF; sistema de arquivos deslocado pelo mtime anterior)"
+    fmt = "%Y-%m-%d %H:%M:%S"
+    return f"{file_path}  ({original_dt.strftime(fmt)} -> {new_dt.strftime(fmt)})"
+
+
+def log_line(prefix: str, msg: str):
+    """Imprime uma linha sem quebrar a barra de progresso do tqdm,
+    quando ela estiver ativa."""
+    line = f"{prefix} {msg}"
+    if HAS_TQDM:
+        tqdm.write(line)
+    else:
+        print(line)
+
+
 def process_files(files, total_hours, dry_run, keep_backup, has_setfile):
     success, errors, no_exif_date = 0, [], []
     iterator = tqdm(files, unit="arquivo") if HAS_TQDM else files
     delta = timedelta(hours=total_hours)
 
     for f in iterator:
+        # Lê a data ORIGINAL antes de alterar nada — é a referência
+        # usada tanto para mostrar o antes/depois quanto para
+        # sincronizar o sistema de arquivos, independente do mtime
+        # que já estava em disco.
+        original_dt = read_primary_datetime(f)
+        new_dt = original_dt + delta if original_dt is not None else None
+
         if dry_run:
-            if not HAS_TQDM:
-                print(f"[SIMULAÇÃO] {f}")
+            log_line("[SIMULAÇÃO]", format_shift_line(f, original_dt, new_dt))
             success += 1
             continue
-
-        # Lê a data ORIGINAL antes de alterar nada — é a referência
-        # que será usada para sincronizar o sistema de arquivos,
-        # independente do mtime que já estava em disco.
-        original_dt = read_primary_datetime(f)
 
         ok, msg = shift_exif_metadata(f, total_hours, keep_backup)
         if not ok:
             errors.append((f, msg))
-            if not HAS_TQDM:
-                print(f"✗ {f}: {msg}")
+            log_line("✗", f"{f}: {msg}")
             continue
 
         if original_dt is not None:
-            sync_filesystem_dates_to(f, original_dt + delta, has_setfile)
+            sync_filesystem_dates_to(f, new_dt, has_setfile)
         else:
             # Sem nenhuma tag de data legível: não há referência
             # confiável, então só deslocamos o que já estava no disco.
@@ -397,8 +417,7 @@ def process_files(files, total_hours, dry_run, keep_backup, has_setfile):
             no_exif_date.append(f)
 
         success += 1
-        if not HAS_TQDM:
-            print(f"✓ {f}")
+        log_line("✓", format_shift_line(f, original_dt, new_dt))
 
     print(f"\nConcluído: {success} sucesso(s), {len(errors)} erro(s).")
     if no_exif_date:
