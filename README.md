@@ -117,9 +117,11 @@ Depois de escolher `1` ou `2`, o fluxo continua igual:
 2. **Modo simulação?** Se responder `s`, o programa mostra o que faria
    sem alterar nada — útil para conferir antes de aplicar de verdade.
 
-3. **Manter backups?** Por padrão (`S`), o `exiftool` cria uma cópia do
-   arquivo original (`arquivo.jpg_original`) antes de alterar os metadados.
-   Recomendado manter ligado até confirmar que o resultado está correto.
+3. **Manter backups?** Por padrão (`S`), o programa copia o arquivo
+   original para `arquivo.jpg_original` **antes** de alterar os
+   metadados — sempre atualizando essa cópia a cada execução (mais
+   detalhes abaixo). Recomendado manter ligado até confirmar que o
+   resultado está correto.
 
 4. **Confirmação final**, com um resumo da operação antes de aplicar.
 
@@ -191,13 +193,24 @@ o Finder ou o Photos depois.
 > sem perceber que já tinha aplicado antes), o resultado final será
 > `+2` horas em relação à data original — e não é um bug, é exatamente
 > como um "shift" relativo deve funcionar. Se quiser desfazer um teste,
-> restaure a partir do arquivo de backup (`arquivo.jpg_original`) antes
-> de tentar de novo.
+> restaure a partir do arquivo de backup (`arquivo.jpg_original`).
+>
+> O backup é sempre **atualizado a cada execução** (reflete o estado
+> imediatamente anterior à última vez que você rodou o programa nesse
+> arquivo — não um teste antigo de várias execuções atrás). Isso evita
+> uma armadilha real que existia antes: o `exiftool`, por padrão, só
+> cria esse backup na primeira vez que mexe num arquivo e não o
+> atualiza depois — então, depois de testar o mesmo arquivo várias
+> vezes, o backup ficava "para trás" e dava a falsa impressão de que o
+> programa tinha somado mais horas do que o pedido. Agora isso não
+> acontece mais: o backup sempre corresponde a "logo antes da última
+> execução".
 
 ## Removendo os backups depois de conferir o resultado
 
-O `exiftool` cria arquivos `*_original` como backup. Depois de confirmar
-que tudo ficou certo, você pode removê-los manualmente:
+O programa cria arquivos `*_original` como backup (sempre o mais
+recente — ver aviso acima). Depois de confirmar que tudo ficou certo,
+você pode removê-los manualmente:
 
 ```bash
 find /Volumes/Media_Dock/2026-06-Viagem -name "*_original" -delete
@@ -236,6 +249,16 @@ disponível.
 - Arquivos sem nenhuma tag de data EXIF/QuickTime legível usam o `mtime`
   que já estava em disco como referência (em vez da data real, que não
   existe nesse caso) — o programa avisa quais arquivos caíram nesse caso.
+- **Cartões SD / mídia removível via leitor USB**: arquivos grandes
+  (vídeos) podem demorar bastante para processar (a velocidade de
+  escrita de um cartão SD é bem menor que a de um SSD interno). O
+  programa já lida com isso corretamente (força a escrita a ser
+  confirmada no disco antes de ajustar a data, evitando que o
+  ajuste seja sobrescrito), mas processos do macOS — como o app
+  **Fotos** ou o **Image Capture**, que costumam escanear cartões com
+  pasta `DCIM` automaticamente — podem competir pelo acesso ao cartão
+  e deixar tudo mais lento ainda. Vale desativar a importação
+  automática do Fotos antes de processar um cartão diretamente.
 
 ## Documentação técnica
 

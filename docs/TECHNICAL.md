@@ -25,9 +25,10 @@ camadas:
    `summarize_extensions`) — sem efeitos colaterais, fáceis de testar
    isoladamente com `pytest`.
 2. **Funções de I/O / efeito colateral** (`read_primary_datetime`,
-   `shift_exif_metadata`, `sync_filesystem_dates_to`,
-   `shift_filesystem_dates_relative`) — dependem de processos externos
-   (`exiftool`, `SetFile`) e do sistema de arquivos.
+   `backup_file_path`, `shift_exif_metadata`, `flush_pending_writes`,
+   `sync_filesystem_dates_to`, `shift_filesystem_dates_relative`) —
+   dependem de processos externos (`exiftool`, `SetFile`) e do sistema
+   de arquivos.
 3. **Camada de menu/interação** (`run`, `run_shift_flow`,
    `ask_offset`, `ask_target_files`, `process_files`) — o loop principal
    apresenta um menu (`1` Alterar DATA, `2` Alterar HORA, `0` Sair) e
@@ -184,28 +185,89 @@ Tools**. Se não estiver instalado, o programa detecta isso no início
 (`shutil.which("SetFile")`) e segue normalmente, apenas avisando que a
 data de criação não será alterada.
 
+### Condição de corrida em mídia removível lenta (cartão SD / leitor USB)
+
+Bug real, reproduzido e confirmado com um usuário processando vídeos
+direto de um cartão SD (`/Volumes/<cartão>/DCIM/...`): depois de uma
+execução aparentemente bem-sucedida (EXIF corrigido corretamente, sem
+erros no log), o `mtime` do arquivo ficava com a data/hora do momento
+em que o script rodou ("agora"), e não com o valor corrigido que o
+programa deveria ter aplicado.
+
+**Diagnóstico**: um teste isolado, chamando só `os.utime()` manualmente
+no mesmo arquivo, funcionou perfeitamente — então não era uma
+limitação do driver exFAT em si. O detalhe que resolveu o mistério foi
+o tempo de execução do log: **33 segundos para um único arquivo de
+~1GB** (vídeo). Isso indica I/O bem mais lento que um SSD interno
+(típico de cartão SD via leitor USB).
+
+**Causa**: condição de corrida entre duas escritas no mesmo arquivo:
+
+1. `exiftool` reescreve o conteúdo do arquivo (potencialmente ~1GB) —
+   em mídia lenta, essa escrita pode ficar em buffer no sistema
+   operacional por um tempo antes de ser fisicamente confirmada no
+   cartão.
+2. Logo em seguida, `sync_filesystem_dates_to()` chama `os.utime()`
+   para corrigir a data — isso atualiza o metadado imediatamente, no
+   cache do SO.
+3. Quando a escrita grande do passo 1 finalmente é fisicamente
+   confirmada no cartão (podendo ser segundos depois), o driver do
+   sistema de arquivos atualiza o `mtime` de novo, **sobrescrevendo
+   silenciosamente** o valor que tínhamos acabado de corrigir no
+   passo 2 — com o horário em que essa escrita física terminou
+   ("agora").
+
+**Correção**: forçar a escrita do `exiftool` a ser fisicamente
+confirmada (fsync) ANTES de tocarmos nos metadados de data, garantindo
+que nosso `os.utime()` seja sempre a última coisa a acontecer:
+
+```python
+def flush_pending_writes(file_path):
+    try:
+        fd = os.open(file_path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass  # mídia/SO sem suporte; seguimos mesmo assim
+
+def sync_filesystem_dates_to(file_path, target_dt, has_setfile):
+    flush_pending_writes(file_path)
+    ts = target_dt.timestamp()
+    os.utime(file_path, (ts, ts))
+    ...
+```
+
+`fsync(fd)` flushea as páginas sujas associadas ao **inode** do
+arquivo (não importa se o fd foi aberto para leitura ou escrita), então
+abrir o arquivo em modo `O_RDONLY` só para forçar o flush é suficiente
+e não corre risco de alterar o conteúdo. A mesma chamada foi adicionada
+em `shift_filesystem_dates_relative()` (o fallback para arquivos sem
+data EXIF), pelo mesmo motivo.
+
+Esse tipo de condição de corrida é mais comum em mídia removível
+(cartões SD, pen drives) do que em discos internos SSD/APFS, onde a
+latência de escrita é baixa o suficiente para o problema praticamente
+nunca aparecer — por isso não tinha sido percebido nos testes
+anteriores, todos feitos em arquivos já no disco principal.
+
 ## Natureza cumulativa do shift (importante para depuração)
 
 O `exiftool` (e, por extensão, este programa) faz um deslocamento
 **relativo**, não define um valor absoluto. Isso significa que rodar o
 programa duas vezes no mesmo arquivo com `+1` hora produz `+2` horas em
 relação ao valor original — cada execução soma em cima do que já está
-gravado, não em cima de um "original" lembrado externamente.
+gravado, não em cima de um "original" lembrado externamente. Isso é
+esperado e correto — mas dois pontos relacionados causavam confusão real
+ao depurar isso, e o segundo era um bug de verdade:
 
-Isso foi confirmado empiricamente (instalando `exiftool`/`ffmpeg` num
-ambiente de teste e rodando `process_files` duas vezes seguidas no
-mesmo arquivo): a primeira chamada levou `11:45 → 12:45` corretamente;
-chamando de novo no mesmo arquivo, sem restaurar o backup, levou
-`12:45 → 13:45` — um total de `+2h` em relação ao `11:45` original, que
-é o comportamento correto e esperado de um shift relativo, mas pode
-parecer um bug se o usuário não perceber que já tinha rodado antes (por
-exemplo, testando a mesma pasta em duas versões diferentes do script,
-ou voltando ao menu e repetindo a operação sem querer).
+### 1. O log agora mostra o antes/depois de cada arquivo
 
-Para tornar isso visível e evitar essa confusão, cada arquivo agora
-imprime o **antes e depois** durante o processamento (e também no modo
-simulação, já que `read_primary_datetime` é chamada antes de decidir se
-vai escrever):
+Para tornar o efeito cumulativo visível, cada arquivo imprime o
+**antes e depois** durante o processamento (também no modo simulação,
+já que `read_primary_datetime` é chamada antes de decidir se vai
+escrever):
 
 ```python
 def format_shift_line(file_path, original_dt, new_dt) -> str:
@@ -223,18 +285,63 @@ def format_shift_line(file_path, original_dt, new_dt) -> str:
 progresso está ativa, para a linha não quebrar o desenho da barra no
 terminal.
 
-Se o resultado mostrado parecer "dobrado" em relação ao esperado, a
-causa mais provável é justamente essa: o arquivo já tinha sido alterado
-numa execução anterior. Para zerar e testar de novo, restaure o backup
-(`arquivo.jpg_original`, criado automaticamente quando "Manter backups"
-está ativado) antes de rodar de novo.
+### 2. Bug real: o backup do `exiftool` não acompanhava execuções seguintes
+
+Inicialmente o backup era feito pelo próprio `exiftool` (comportamento
+padrão: renomear o arquivo para `*_original` antes de escrever). O
+problema, confirmado empiricamente: **o `exiftool` só cria esse backup
+na primeira vez** que mexe num arquivo. Em execuções seguintes — mesmo
+com "Manter backups" ativado de novo — ele **não atualiza** o backup
+existente; ele fica congelado no estado da primeiríssima execução,
+enquanto o arquivo principal segue acumulando ajustes a cada chamada.
+
+```
+Execução 1 (+1h): arquivo 11:45→12:45 | backup grava 11:45 (ok)
+Execução 2 (+1h): arquivo 12:45→13:45 | backup CONTINUA mostrando 11:45 (!)
+```
+
+Isso fazia o backup parecer "a referência de antes do último teste",
+quando na verdade era "a referência de antes do primeiro teste, há
+várias execuções atrás" — levando a achar que o programa tinha somado
+mais horas do que o pedido, quando na realidade cada execução individual
+estava correta; só o backup é que estava desatualizado.
+
+**Correção**: o backup agora é feito por NÓS (`shutil.copy2`), sempre
+sobrescrevendo o anterior, ANTES de cada chamada ao `exiftool` — que
+passa a rodar sempre com `-overwrite_original` (não dependemos mais do
+mecanismo de backup dele):
+
+```python
+def shift_exif_metadata(file_path, hours, keep_backup):
+    if keep_backup:
+        shutil.copy2(file_path, backup_file_path(file_path))  # sempre sobrescreve
+
+    cmd = ["exiftool", "-m", f"-AllDates{shift_expr}", "-overwrite_original"]
+    ...
+```
+
+Com isso, `arquivo.ext_original` sempre reflete o estado **imediatamente
+anterior à última execução** — nunca mais um teste antigo esquecido.
+Validado com um teste de integração real (instalando `exiftool`/`ffmpeg`
+e rodando duas execuções seguidas: `+3h` e depois `+1h`) — depois da
+segunda execução, o backup mostrou corretamente o valor de ANTES da
+segunda execução (`14:45:26`, resultado da primeira), não mais o valor
+original de várias execuções atrás (`11:45:26`).
+
+Se mesmo assim o resultado parecer "dobrado" em relação ao esperado, a
+causa mais provável continua sendo a mesma raiz (efeito cumulativo): o
+arquivo já tinha sido alterado numa execução anterior a esta correção,
+ou numa sessão de teste anterior. Para zerar e testar do zero, restaure
+o backup mais recente antes de rodar de novo.
 
 ## Tratamento de erros e segurança
 
-- **Backups**: por padrão, o `exiftool` mantém uma cópia do arquivo
-  original (`arquivo.jpg_original`) antes de qualquer escrita. Isso só é
-  desativado se o usuário explicitamente responder "não" à pergunta de
-  backup (usa `-overwrite_original`).
+- **Backups**: quando "Manter backups" está ativado, o programa copia o
+  arquivo (`shutil.copy2`) para `arquivo.ext_original` **antes** de
+  qualquer escrita, sempre sobrescrevendo um backup anterior — nunca
+  dependemos do backup automático do `exiftool` (ver seção acima sobre
+  por que isso importa). Se a cópia falhar (ex: disco cheio,
+  permissão), o arquivo NÃO é alterado.
 - **Modo simulação (dry-run)**: lista os arquivos que seriam processados
   sem chamar `exiftool` nem tocar no sistema de arquivos.
 - **Confirmação explícita**: nenhuma alteração é aplicada sem uma

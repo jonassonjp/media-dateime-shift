@@ -17,13 +17,18 @@ from unittest.mock import patch
 import pytest
 from media_datetime_shift import (
     MENU_OPTIONS,
+    backup_file_path,
     build_exiftool_shift_expr,
+    flush_pending_writes,
     format_shift_line,
     parse_exiftool_datetime,
     parse_signed_int_offset,
     process_files,
     resolve_specific_files,
+    shift_exif_metadata,
+    shift_filesystem_dates_relative,
     summarize_extensions,
+    sync_filesystem_dates_to,
 )
 
 
@@ -184,6 +189,182 @@ class TestProcessFilesUsesExifDateNotStaleMtime:
 
         mock_sync.assert_not_called()
         mock_relative.assert_not_called()
+
+
+class TestBackupFilePath:
+    def test_appends_original_suffix(self):
+        assert backup_file_path("/tmp/foto.jpg") == "/tmp/foto.jpg_original"
+
+
+class TestShiftExifMetadataBackupHandling:
+    """O backup agora é feito por NÓS (não pelo exiftool), sempre
+    sobrescrevendo o anterior. Isso corrige o comportamento confuso do
+    exiftool, que só cria o backup na primeira vez e não o atualiza
+    nas execuções seguintes — fazendo o backup "ficar para trás" depois
+    de múltiplos testes no mesmo arquivo."""
+
+    @staticmethod
+    def _mock_subprocess_run():
+        patcher = patch("media_datetime_shift.subprocess.run")
+        mock_run = patcher.start()
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.stdout = "1 image files updated"
+        mock_run.return_value.stderr = ""
+        return patcher, mock_run
+
+    def test_creates_backup_with_current_content_when_keep_backup_true(self, tmp_path):
+        f = tmp_path / "foto.jpg"
+        f.write_bytes(b"conteudo v1")
+
+        patcher, _ = self._mock_subprocess_run()
+        try:
+            shift_exif_metadata(str(f), 1, keep_backup=True)
+        finally:
+            patcher.stop()
+
+        backup = tmp_path / "foto.jpg_original"
+        assert backup.exists()
+        assert backup.read_bytes() == b"conteudo v1"
+
+    def test_backup_is_overwritten_each_run_not_frozen_on_first(self, tmp_path):
+        f = tmp_path / "foto.jpg"
+        f.write_bytes(b"estado 1")
+
+        patcher, _ = self._mock_subprocess_run()
+        try:
+            shift_exif_metadata(str(f), 1, keep_backup=True)
+        finally:
+            patcher.stop()
+        assert (tmp_path / "foto.jpg_original").read_bytes() == b"estado 1"
+
+        # Simula o exiftool tendo alterado o arquivo principal na 1a execução.
+        f.write_bytes(b"estado 2 (resultado da 1a execucao)")
+
+        patcher, _ = self._mock_subprocess_run()
+        try:
+            shift_exif_metadata(str(f), 1, keep_backup=True)
+        finally:
+            patcher.stop()
+
+        # O backup deve refletir o estado imediatamente ANTERIOR a esta
+        # execução (estado 2), não mais travado no estado 1.
+        assert (tmp_path / "foto.jpg_original").read_bytes() == b"estado 2 (resultado da 1a execucao)"
+
+    def test_no_backup_created_when_keep_backup_false(self, tmp_path):
+        f = tmp_path / "foto.jpg"
+        f.write_bytes(b"conteudo")
+
+        patcher, _ = self._mock_subprocess_run()
+        try:
+            shift_exif_metadata(str(f), 1, keep_backup=False)
+        finally:
+            patcher.stop()
+
+        assert not (tmp_path / "foto.jpg_original").exists()
+
+    def test_always_passes_overwrite_original_to_exiftool(self, tmp_path):
+        # Como o backup agora é feito por nós, sempre usamos
+        # -overwrite_original no exiftool, independente de keep_backup,
+        # para não depender do mecanismo de backup dele.
+        f = tmp_path / "foto.jpg"
+        f.write_bytes(b"conteudo")
+
+        patcher, mock_run = self._mock_subprocess_run()
+        try:
+            shift_exif_metadata(str(f), 1, keep_backup=True)
+            cmd_with_backup = mock_run.call_args[0][0]
+        finally:
+            patcher.stop()
+
+        patcher, mock_run = self._mock_subprocess_run()
+        try:
+            shift_exif_metadata(str(f), 1, keep_backup=False)
+            cmd_without_backup = mock_run.call_args[0][0]
+        finally:
+            patcher.stop()
+
+        assert "-overwrite_original" in cmd_with_backup
+        assert "-overwrite_original" in cmd_without_backup
+
+    def test_backup_failure_prevents_exif_write(self, tmp_path):
+        f = tmp_path / "foto.jpg"
+        f.write_bytes(b"conteudo")
+
+        with patch(
+            "media_datetime_shift.shutil.copy2", side_effect=OSError("disco cheio")
+        ), patch("media_datetime_shift.subprocess.run") as mock_run:
+            ok, msg = shift_exif_metadata(str(f), 1, keep_backup=True)
+
+        assert ok is False
+        assert "backup" in msg.lower()
+        mock_run.assert_not_called()
+
+
+class TestFlushPendingWrites:
+    """Cobre o fix da condição de corrida observada em mídia removível
+    lenta (cartão SD via leitor USB): uma escrita grande do exiftool
+    podia ainda estar em buffer quando ajustávamos o mtime logo
+    depois, e ao ser fisicamente concluída minutos/segundos depois,
+    sobrescrevia silenciosamente nosso ajuste de data."""
+
+    def test_does_not_raise_on_real_file(self, tmp_path):
+        f = tmp_path / "video.mp4"
+        f.write_bytes(b"conteudo de teste")
+        flush_pending_writes(str(f))  # não deve levantar exceção
+
+    def test_does_not_raise_on_missing_file(self):
+        # Mídia/SO sem suporte, ou caminho inválido: não deve quebrar
+        # o fluxo principal, só seguimos sem o flush.
+        flush_pending_writes("/caminho/que/nao/existe.mp4")
+
+
+class TestSyncFilesystemDatesFlushOrdering:
+    """O flush precisa acontecer ANTES do os.utime() — é a ordem que
+    garante que nosso ajuste de data seja a última coisa a tocar no
+    arquivo, vencendo qualquer escrita atrasada do exiftool."""
+
+    def test_sync_flushes_before_utime(self, tmp_path):
+        f = tmp_path / "video.mp4"
+        f.write_bytes(b"conteudo")
+        call_order = []
+
+        with patch(
+            "media_datetime_shift.flush_pending_writes",
+            side_effect=lambda p: call_order.append("flush"),
+        ), patch(
+            "media_datetime_shift.os.utime",
+            side_effect=lambda *a, **k: call_order.append("utime"),
+        ):
+            sync_filesystem_dates_to(str(f), datetime(2026, 6, 17, 13, 18, 21), has_setfile=False)
+
+        assert call_order == ["flush", "utime"]
+
+    def test_relative_shift_flushes_before_utime(self, tmp_path):
+        f = tmp_path / "video.mp4"
+        f.write_bytes(b"conteudo")
+        call_order = []
+
+        with patch(
+            "media_datetime_shift.flush_pending_writes",
+            side_effect=lambda p: call_order.append("flush"),
+        ), patch(
+            "media_datetime_shift.os.utime",
+            side_effect=lambda *a, **k: call_order.append("utime"),
+        ):
+            shift_filesystem_dates_relative(str(f), 1, has_setfile=False)
+
+        assert call_order == ["flush", "utime"]
+
+    def test_sync_still_sets_correct_timestamp_after_flush(self, tmp_path):
+        # Garante que o flush não interfere no valor final aplicado.
+        f = tmp_path / "video.mp4"
+        f.write_bytes(b"conteudo")
+        target = datetime(2026, 6, 17, 13, 18, 21)
+
+        sync_filesystem_dates_to(str(f), target, has_setfile=False)
+
+        result = datetime.fromtimestamp(os.stat(str(f)).st_mtime)
+        assert result == target
 
 
 class TestMenuOptions:

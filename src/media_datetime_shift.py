@@ -204,16 +204,40 @@ def read_primary_datetime(file_path: str):
     return None
 
 
+def backup_file_path(file_path: str) -> str:
+    """Nome do arquivo de backup, no mesmo padrão que o exiftool usava
+    ('arquivo.ext_original'), mantido por compatibilidade com backups
+    antigos e com a documentação existente."""
+    return file_path + "_original"
+
+
 def shift_exif_metadata(file_path: str, hours: int, keep_backup: bool):
     """Desloca as tags de data/hora EXIF/QuickTime de um arquivo.
 
+    O backup é feito por NÓS (não pelo exiftool) antes de cada chamada,
+    sempre sobrescrevendo o `_original` anterior. Isso é proposital: o
+    exiftool, por padrão, só cria esse backup na PRIMEIRA vez que toca
+    no arquivo e não o atualiza nas execuções seguintes — o que faz o
+    backup "ficar para trás" depois de múltiplas execuções e parecer
+    que o ajuste pulou mais horas do que o pedido. Fazendo o backup nós
+    mesmos, `_original` sempre reflete o estado imediatamente anterior
+    à ÚLTIMA execução, nunca um teste antigo esquecido.
+
     Retorna (sucesso: bool, mensagem: str).
     """
+    if keep_backup:
+        try:
+            shutil.copy2(file_path, backup_file_path(file_path))
+        except OSError as exc:
+            return False, f"Falha ao criar backup: {exc}"
+
     shift_expr = build_exiftool_shift_expr(hours)
 
-    cmd = ["exiftool", "-m", f"-AllDates{shift_expr}"]
-    if not keep_backup:
-        cmd.append("-overwrite_original")
+    # Sempre usamos -overwrite_original: o backup (quando pedido) já
+    # foi feito acima, então não precisamos do backup automático do
+    # exiftool (que tem o comportamento de "só na primeira vez"
+    # descrito acima).
+    cmd = ["exiftool", "-m", f"-AllDates{shift_expr}", "-overwrite_original"]
 
     if Path(file_path).suffix.lower() in VIDEO_EXTENSIONS:
         for tag in VIDEO_DATE_TAGS:
@@ -225,6 +249,29 @@ def shift_exif_metadata(file_path: str, hours: int, keep_backup: bool):
     return ok, (result.stdout + result.stderr).strip()
 
 
+def flush_pending_writes(file_path: str):
+    """Força o conteúdo já escrito no arquivo a ser fisicamente
+    confirmado no disco (fsync), antes de mexermos nos metadados de
+    data. Necessário em mídia removível lenta (cartão SD via leitor
+    USB, por exemplo): uma escrita grande (o exiftool reescrevendo um
+    vídeo de ~1GB) pode ainda estar em buffer quando chamamos
+    os.utime() logo em seguida; se essa escrita só for fisicamente
+    concluída alguns segundos depois, o driver do sistema de arquivos
+    pode atualizar o mtime de novo nesse momento, sobrescrevendo
+    silenciosamente o valor que acabamos de corrigir. Fazer o fsync
+    antes do utime garante que nosso ajuste de data seja sempre a
+    última coisa a tocar no arquivo.
+    """
+    try:
+        fd = os.open(file_path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass  # mídia/SO que não suporta fsync aqui; seguimos mesmo assim
+
+
 def sync_filesystem_dates_to(file_path: str, target_dt: datetime, has_setfile: bool):
     """Define mtime/atime (e birthtime, se possível) do arquivo para
     coincidir EXATAMENTE com `target_dt` — a data/hora já corrigida,
@@ -234,6 +281,8 @@ def sync_filesystem_dates_to(file_path: str, target_dt: datetime, has_setfile: b
     mtime em disco não refletia a data real da foto/vídeo (comum após
     copiar, sincronizar com a nuvem, ou fazer AirDrop do arquivo).
     """
+    flush_pending_writes(file_path)
+
     ts = target_dt.timestamp()
     os.utime(file_path, (ts, ts))
 
@@ -250,6 +299,8 @@ def shift_filesystem_dates_relative(file_path: str, hours: int, has_setfile: boo
     de data EXIF/QuickTime legível (sync_filesystem_dates_to não pode
     ser usada nesse caso, pois não há data de referência confiável).
     """
+    flush_pending_writes(file_path)
+
     stat = os.stat(file_path)
     delta = timedelta(hours=hours)
 
