@@ -93,6 +93,7 @@ O que deseja fazer?
 
   1 - Alterar DATA  (ajusta por dias, ex: +1, -3)
   2 - Alterar HORA  (ajusta por horas, ex: +3, -5)
+  3 - Definir data/hora exata (digite o valor certo)
   0 - Sair
 
 Escolha uma opção:
@@ -104,9 +105,12 @@ Escolha uma opção:
   `-5`, `+27`). Funciona também para grandes deslocamentos (`+27`
   horas), que automaticamente avançam a data também ao passar da
   meia-noite.
+- **`3` (Definir data/hora exata)** — em vez de você calcular a
+  diferença de cabeça, digite a data/hora **certa** e o programa
+  calcula o ajuste sozinho (veja detalhes abaixo).
 - **`0` (Sair)** — encerra o programa.
 
-Depois de escolher `1` ou `2`, o fluxo continua igual:
+Depois de escolher `1`, `2` ou `3`, o fluxo continua parecido:
 
 1. **O que deseja processar?**
    - `[1]` Diretório inteiro — busca recursiva por todos os arquivos de
@@ -205,6 +209,77 @@ o Finder ou o Photos depois.
 > programa tinha somado mais horas do que o pedido. Agora isso não
 > acontece mais: o backup sempre corresponde a "logo antes da última
 > execução".
+
+### Opção 3 — Definir data/hora exata (sem calcular a diferença manualmente)
+
+Em vez de você descobrir e digitar "+4 horas" ou "-3 dias", essa opção
+deixa você digitar diretamente a data/hora **certa** de um arquivo, e o
+programa calcula o ajuste necessário sozinho.
+
+Como funciona:
+
+1. Você escolhe os arquivos (diretório ou específicos), igual às
+   outras opções.
+2. O programa usa o **primeiro arquivo da lista** como referência, lê a
+   data/hora atual gravada nele e mostra na tela.
+3. Você digita a data/hora **certa** desse arquivo de referência, em um
+   destes dois formatos:
+   - `DD/MM/AAAA HH:MM:SS` (ou sem segundos: `DD/MM/AAAA HH:MM`) — use
+     quando a **data** também estiver errada, não só a hora.
+   - Só `HH:MM:SS` (ou `HH:MM`) — mantém a mesma data do arquivo de
+     referência, só troca o horário. É o caso mais comum (fuso horário
+     errado, data certa).
+4. O programa calcula a diferença e aplica **esse mesmo ajuste** a
+   todos os arquivos selecionados — preservando a diferença de tempo
+   entre eles. Ou seja, se você selecionou vários arquivos, eles **não**
+   ficam todos com a mesma data/hora; cada um recebe o mesmo
+   deslocamento, mantendo a ordem cronológica entre as fotos/vídeos.
+
+#### Exemplo de sessão (opção 3)
+
+```
+=============================================
+  Media DateTime Shift
+  Definir data/hora exata
+=============================================
+
+O que deseja processar?
+  [1] Diretório inteiro (busca recursiva)
+  [2] Arquivos específicos
+Escolha [1/2]: 2
+Caminho completo (pode separar por vírgula): /Volumes/Photos128GB/DCIM/Camera01/VID_20260617_121821_394.mp4
+
+Encontrados 1 arquivo(s):
+  - 1 MP4
+
+Arquivo de referência: /Volumes/Photos128GB/DCIM/Camera01/VID_20260617_121821_394.mp4
+Data/hora atual desse arquivo: 17/06/2026 11:18:21
+
+Qual é a data/hora CERTA desse arquivo?
+  'DD/MM/AAAA HH:MM:SS' (data e hora), ou
+  'HH:MM:SS' (só a hora, mantém a mesma data)
+> 12:18:21
+
+Ajuste calculado: +1h
+
+Executar em modo simulação (não altera nada)? [s/N]: n
+Manter backups dos arquivos originais (recomendado)? [S/n]:
+
+Resumo da operação:
+  Ajuste calculado: +1h
+  Arquivos: 1
+  Modo: APLICAR ALTERAÇÕES
+  Backups: sim
+
+Confirma a operação? [s/N]: s
+✓ VID_20260617_121821_394.mp4  (2026-06-17 11:18:21 -> 2026-06-17 12:18:21)
+
+Concluído: 1 sucesso(s), 0 erro(s).
+```
+
+> Se o arquivo de referência (o primeiro da seleção) não tiver nenhuma
+> tag de data EXIF/QuickTime legível, o programa avisa e cancela —
+> escolha um arquivo com metadados de data para usar como referência.
 
 ## Removendo os backups depois de conferir o resultado
 

@@ -11,7 +11,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 import pytest
@@ -21,10 +21,13 @@ from media_datetime_shift import (
     build_exiftool_shift_expr,
     flush_pending_writes,
     format_shift_line,
+    format_timedelta,
     parse_exiftool_datetime,
     parse_signed_int_offset,
+    parse_target_datetime,
     process_files,
     resolve_specific_files,
+    run_set_exact_datetime_flow,
     shift_exif_metadata,
     shift_filesystem_dates_relative,
     summarize_extensions,
@@ -113,7 +116,7 @@ class TestProcessFilesDryRunDoesNotWrite:
         ) as mock_sync, patch(
             "media_datetime_shift.shift_filesystem_dates_relative"
         ) as mock_relative:
-            process_files([str(jpg)], total_hours=1, dry_run=True, keep_backup=True, has_setfile=False)
+            process_files([str(jpg)], timedelta(hours=1), dry_run=True, keep_backup=True, has_setfile=False)
 
         mock_shift_exif.assert_not_called()
         mock_sync.assert_not_called()
@@ -146,7 +149,7 @@ class TestProcessFilesUsesExifDateNotStaleMtime:
         ) as mock_sync, patch(
             "media_datetime_shift.shift_filesystem_dates_relative"
         ) as mock_relative:
-            process_files([str(jpg)], total_hours=1, dry_run=False, keep_backup=True, has_setfile=False)
+            process_files([str(jpg)], timedelta(hours=1), dry_run=False, keep_backup=True, has_setfile=False)
 
         # sync_filesystem_dates_to deve ter sido chamada com 12:45,
         # derivada da data EXIF original — não com o mtime obsoleto.
@@ -166,9 +169,9 @@ class TestProcessFilesUsesExifDateNotStaleMtime:
         ) as mock_sync, patch(
             "media_datetime_shift.shift_filesystem_dates_relative"
         ) as mock_relative:
-            process_files([str(jpg)], total_hours=1, dry_run=False, keep_backup=True, has_setfile=False)
+            process_files([str(jpg)], timedelta(hours=1), dry_run=False, keep_backup=True, has_setfile=False)
 
-        mock_relative.assert_called_once_with(str(jpg), 1, False)
+        mock_relative.assert_called_once_with(str(jpg), timedelta(hours=1), False)
         mock_sync.assert_not_called()
 
     def test_skips_filesystem_sync_when_exif_write_fails(self, tmp_path):
@@ -185,7 +188,7 @@ class TestProcessFilesUsesExifDateNotStaleMtime:
         ) as mock_sync, patch(
             "media_datetime_shift.shift_filesystem_dates_relative"
         ) as mock_relative:
-            process_files([str(jpg)], total_hours=1, dry_run=False, keep_backup=True, has_setfile=False)
+            process_files([str(jpg)], timedelta(hours=1), dry_run=False, keep_backup=True, has_setfile=False)
 
         mock_sync.assert_not_called()
         mock_relative.assert_not_called()
@@ -218,7 +221,7 @@ class TestShiftExifMetadataBackupHandling:
 
         patcher, _ = self._mock_subprocess_run()
         try:
-            shift_exif_metadata(str(f), 1, keep_backup=True)
+            shift_exif_metadata(str(f), timedelta(hours=1), keep_backup=True)
         finally:
             patcher.stop()
 
@@ -232,7 +235,7 @@ class TestShiftExifMetadataBackupHandling:
 
         patcher, _ = self._mock_subprocess_run()
         try:
-            shift_exif_metadata(str(f), 1, keep_backup=True)
+            shift_exif_metadata(str(f), timedelta(hours=1), keep_backup=True)
         finally:
             patcher.stop()
         assert (tmp_path / "foto.jpg_original").read_bytes() == b"estado 1"
@@ -242,7 +245,7 @@ class TestShiftExifMetadataBackupHandling:
 
         patcher, _ = self._mock_subprocess_run()
         try:
-            shift_exif_metadata(str(f), 1, keep_backup=True)
+            shift_exif_metadata(str(f), timedelta(hours=1), keep_backup=True)
         finally:
             patcher.stop()
 
@@ -256,7 +259,7 @@ class TestShiftExifMetadataBackupHandling:
 
         patcher, _ = self._mock_subprocess_run()
         try:
-            shift_exif_metadata(str(f), 1, keep_backup=False)
+            shift_exif_metadata(str(f), timedelta(hours=1), keep_backup=False)
         finally:
             patcher.stop()
 
@@ -271,14 +274,14 @@ class TestShiftExifMetadataBackupHandling:
 
         patcher, mock_run = self._mock_subprocess_run()
         try:
-            shift_exif_metadata(str(f), 1, keep_backup=True)
+            shift_exif_metadata(str(f), timedelta(hours=1), keep_backup=True)
             cmd_with_backup = mock_run.call_args[0][0]
         finally:
             patcher.stop()
 
         patcher, mock_run = self._mock_subprocess_run()
         try:
-            shift_exif_metadata(str(f), 1, keep_backup=False)
+            shift_exif_metadata(str(f), timedelta(hours=1), keep_backup=False)
             cmd_without_backup = mock_run.call_args[0][0]
         finally:
             patcher.stop()
@@ -293,7 +296,7 @@ class TestShiftExifMetadataBackupHandling:
         with patch(
             "media_datetime_shift.shutil.copy2", side_effect=OSError("disco cheio")
         ), patch("media_datetime_shift.subprocess.run") as mock_run:
-            ok, msg = shift_exif_metadata(str(f), 1, keep_backup=True)
+            ok, msg = shift_exif_metadata(str(f), timedelta(hours=1), keep_backup=True)
 
         assert ok is False
         assert "backup" in msg.lower()
@@ -351,7 +354,7 @@ class TestSyncFilesystemDatesFlushOrdering:
             "media_datetime_shift.os.utime",
             side_effect=lambda *a, **k: call_order.append("utime"),
         ):
-            shift_filesystem_dates_relative(str(f), 1, has_setfile=False)
+            shift_filesystem_dates_relative(str(f), timedelta(hours=1), has_setfile=False)
 
         assert call_order == ["flush", "utime"]
 
@@ -369,32 +372,176 @@ class TestSyncFilesystemDatesFlushOrdering:
 
 class TestMenuOptions:
     """Garante que o menu (1=data, 2=hora) converte corretamente para
-    o total de horas usado internamente pelo motor de shift."""
+    o timedelta usado internamente pelo motor de shift."""
 
-    def test_date_option_multiplies_by_24(self):
+    def test_date_option_produces_days_as_timedelta(self):
         option = MENU_OPTIONS["1"]
-        days = parse_signed_int_offset("+2")
-        assert days * option["multiplicador"] == 48
+        value = parse_signed_int_offset("+2")
+        delta = timedelta(hours=value * option["multiplicador"])
+        assert delta == timedelta(days=2)
 
-    def test_hour_option_uses_value_directly(self):
+    def test_hour_option_produces_hours_as_timedelta(self):
         option = MENU_OPTIONS["2"]
-        hours = parse_signed_int_offset("-5")
-        assert hours * option["multiplicador"] == -5
+        value = parse_signed_int_offset("-5")
+        delta = timedelta(hours=value * option["multiplicador"])
+        assert delta == timedelta(hours=-5)
 
     def test_exit_option_not_in_menu(self):
         assert "0" not in MENU_OPTIONS
 
+    def test_set_exact_datetime_option_not_in_menu_options(self):
+        # A opção 3 ("Definir data/hora exata") tem fluxo próprio
+        # (run_set_exact_datetime_flow), não usa o padrão
+        # unidade/multiplicador de MENU_OPTIONS.
+        assert "3" not in MENU_OPTIONS
+
 
 class TestBuildExiftoolShiftExpr:
-    def test_positive_shift(self):
-        assert build_exiftool_shift_expr(3) == "+=0:0:0 3:0:0"
+    def test_positive_hours_only(self):
+        assert build_exiftool_shift_expr(timedelta(hours=3)) == "+=0:0:0 3:0:0"
 
-    def test_negative_shift(self):
-        assert build_exiftool_shift_expr(-5) == "-=0:0:0 5:0:0"
+    def test_negative_hours_only(self):
+        assert build_exiftool_shift_expr(timedelta(hours=-5)) == "-=0:0:0 5:0:0"
 
-    def test_shift_above_24_hours(self):
-        # O exiftool resolve o carry de dias internamente.
-        assert build_exiftool_shift_expr(27) == "+=0:0:0 27:0:0"
+    def test_hours_above_24_resolved_as_days_by_timedelta(self):
+        # timedelta já normaliza 27h em 1 dia + 3h internamente.
+        assert build_exiftool_shift_expr(timedelta(hours=27)) == "+=0:0:1 3:0:0"
+
+    def test_sub_hour_precision_minutes_and_seconds(self):
+        # Necessário para o modo "definir data/hora exata", onde o
+        # delta calculado raramente é um número redondo de horas.
+        delta = timedelta(hours=4, minutes=28, seconds=29)
+        assert build_exiftool_shift_expr(delta) == "+=0:0:0 4:28:29"
+
+    def test_negative_sub_hour_precision(self):
+        delta = timedelta(hours=-1, minutes=-30)
+        assert build_exiftool_shift_expr(delta) == "-=0:0:0 1:30:0"
+
+    def test_zero_delta(self):
+        assert build_exiftool_shift_expr(timedelta(0)) == "+=0:0:0 0:0:0"
+
+
+class TestFormatTimedelta:
+    def test_hours_only(self):
+        assert format_timedelta(timedelta(hours=3)) == "+3h"
+
+    def test_negative_hours(self):
+        assert format_timedelta(timedelta(hours=-5)) == "-5h"
+
+    def test_days_and_hours(self):
+        assert format_timedelta(timedelta(days=1, hours=3)) == "+1d 3h"
+
+    def test_full_precision(self):
+        delta = timedelta(hours=4, minutes=28, seconds=29)
+        assert format_timedelta(delta) == "+4h 28min 29s"
+
+    def test_zero_shows_zero_seconds(self):
+        assert format_timedelta(timedelta(0)) == "+0s"
+
+    def test_omits_zeroed_components(self):
+        # 2 dias exatos não deveria mostrar "0h 0min 0s" no meio.
+        assert format_timedelta(timedelta(days=2)) == "+2d"
+
+
+class TestParseTargetDatetime:
+    REFERENCE = datetime(2026, 6, 17, 11, 18, 21)
+
+    def test_full_date_and_time_with_seconds(self):
+        result = parse_target_datetime("17/06/2026 12:18:21", self.REFERENCE)
+        assert result == datetime(2026, 6, 17, 12, 18, 21)
+
+    def test_full_date_and_time_without_seconds(self):
+        result = parse_target_datetime("17/06/2026 12:18", self.REFERENCE)
+        assert result == datetime(2026, 6, 17, 12, 18, 0)
+
+    def test_different_date_than_reference(self):
+        # Caso a DATA também esteja errada, não só a hora.
+        result = parse_target_datetime("18/06/2026 09:00:00", self.REFERENCE)
+        assert result == datetime(2026, 6, 18, 9, 0, 0)
+
+    def test_only_time_keeps_reference_date(self):
+        result = parse_target_datetime("15:45:26", self.REFERENCE)
+        assert result == datetime(2026, 6, 17, 15, 45, 26)
+
+    def test_only_time_without_seconds_keeps_reference_date(self):
+        result = parse_target_datetime("15:45", self.REFERENCE)
+        assert result == datetime(2026, 6, 17, 15, 45, 0)
+
+    def test_empty_raises(self):
+        with pytest.raises(ValueError):
+            parse_target_datetime("", self.REFERENCE)
+
+    def test_garbage_raises(self):
+        with pytest.raises(ValueError):
+            parse_target_datetime("não é uma data", self.REFERENCE)
+
+
+class TestRunSetExactDatetimeFlow:
+    """Integração do fluxo da opção 3: o delta deve ser calculado a
+    partir da diferença entre a data digitada e a data ATUAL do
+    arquivo de referência (o primeiro da lista), e esse MESMO delta
+    aplicado a todos os arquivos selecionados."""
+
+    def test_computes_delta_from_reference_file_and_applies_to_all(self, tmp_path):
+        f1 = tmp_path / "a_video1.mp4"
+        f2 = tmp_path / "b_video2.mp4"
+        f1.write_bytes(b"x")
+        f2.write_bytes(b"x")
+
+        reference_dt = datetime(2026, 6, 17, 11, 18, 21)
+        target_dt = datetime(2026, 6, 17, 12, 18, 21)  # usuário digita +1h
+
+        with patch(
+            "media_datetime_shift.ask_target_files", return_value=[str(f1), str(f2)]
+        ), patch(
+            "media_datetime_shift.read_primary_datetime", return_value=reference_dt
+        ), patch(
+            "media_datetime_shift.ask_target_datetime", return_value=target_dt
+        ), patch(
+            "media_datetime_shift.confirm", side_effect=[False, True, True]
+            # dry_run=False, keep_backup=True, confirma=True
+        ), patch(
+            "media_datetime_shift.process_files"
+        ) as mock_process:
+            run_set_exact_datetime_flow(has_setfile=False)
+
+        mock_process.assert_called_once()
+        call_args = mock_process.call_args[0]
+        assert call_args[0] == [str(f1), str(f2)]
+        assert call_args[1] == timedelta(hours=1)
+
+    def test_aborts_when_reference_file_has_no_exif_date(self, tmp_path):
+        f1 = tmp_path / "video.mp4"
+        f1.write_bytes(b"x")
+
+        with patch(
+            "media_datetime_shift.ask_target_files", return_value=[str(f1)]
+        ), patch(
+            "media_datetime_shift.read_primary_datetime", return_value=None
+        ), patch(
+            "media_datetime_shift.process_files"
+        ) as mock_process:
+            run_set_exact_datetime_flow(has_setfile=False)
+
+        mock_process.assert_not_called()
+
+    def test_aborts_when_target_equals_reference(self, tmp_path):
+        f1 = tmp_path / "video.mp4"
+        f1.write_bytes(b"x")
+        same_dt = datetime(2026, 6, 17, 11, 18, 21)
+
+        with patch(
+            "media_datetime_shift.ask_target_files", return_value=[str(f1)]
+        ), patch(
+            "media_datetime_shift.read_primary_datetime", return_value=same_dt
+        ), patch(
+            "media_datetime_shift.ask_target_datetime", return_value=same_dt
+        ), patch(
+            "media_datetime_shift.process_files"
+        ) as mock_process:
+            run_set_exact_datetime_flow(has_setfile=False)
+
+        mock_process.assert_not_called()
 
 
 class TestResolveSpecificFiles:

@@ -97,15 +97,46 @@ def parse_signed_int_offset(raw: str) -> int:
     return value
 
 
-def build_exiftool_shift_expr(hours: int) -> str:
+def build_exiftool_shift_expr(delta: timedelta) -> str:
     """Monta a expressão de shift no formato esperado pelo exiftool.
 
-    Formato: '[+-]=Y:M:D H:M:S'. Mantemos a parte Y:M:D zerada e
-    colocamos o valor de horas (que pode ser >24, o exiftool resolve
-    o "carry" para dias/meses/anos automaticamente) na parte H:M:S.
+    Formato: '[+-]=Y:M:D H:M:S'. Não usamos Y/M (ano/mês) — só dias
+    (o exiftool resolve o "carry" para meses/anos sozinho, se
+    necessário) e H:M:S, derivados diretamente do timedelta. Isso
+    permite deslocamentos com qualquer precisão (não só horas
+    inteiras), necessário para o modo "definir data/hora exata", que
+    calcula um delta exato a partir de duas datas completas.
     """
-    sign = "+" if hours >= 0 else "-"
-    return f"{sign}=0:0:0 {abs(hours)}:0:0"
+    sign = "+" if delta.total_seconds() >= 0 else "-"
+    total_seconds = abs(int(delta.total_seconds()))
+    days, remainder = divmod(total_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{sign}=0:0:{days} {hours}:{minutes}:{seconds}"
+
+
+def format_timedelta(delta: timedelta) -> str:
+    """Formata um timedelta de forma legível para o usuário, ex:
+    '+1d 4h 28min 29s' ou '-3h'. Componentes zerados são omitidos
+    (exceto segundos, se for o único componente não-zero ou se o
+    delta inteiro for zero)."""
+    sign = "+" if delta.total_seconds() >= 0 else "-"
+    total_seconds = abs(int(delta.total_seconds()))
+    days, remainder = divmod(total_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}min")
+    if seconds or not parts:
+        parts.append(f"{seconds}s")
+
+    return sign + " ".join(parts)
 
 
 def parse_exiftool_datetime(value: str):
@@ -121,6 +152,40 @@ def parse_exiftool_datetime(value: str):
         return datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
     except ValueError:
         return None
+
+
+def parse_target_datetime(raw: str, reference_date: datetime) -> datetime:
+    """Converte a entrada do usuário (data/hora "certa", para o modo
+    "Definir data/hora exata") para um datetime completo.
+
+    Aceita data+hora completas ('DD/MM/AAAA HH:MM:SS', com ou sem
+    segundos), ou apenas a hora ('HH:MM:SS'/'HH:MM') — nesse caso a
+    DATA de `reference_date` é mantida, útil quando só o horário está
+    errado e a data já está certa.
+
+    Levanta ValueError se nenhum formato reconhecido bater.
+    """
+    raw = raw.strip()
+    if not raw:
+        raise ValueError("valor vazio")
+
+    for fmt in ("%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M"):
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+
+    for fmt in ("%H:%M:%S", "%H:%M"):
+        try:
+            parsed_time = datetime.strptime(raw, fmt).time()
+            return datetime.combine(reference_date.date(), parsed_time)
+        except ValueError:
+            continue
+
+    raise ValueError(
+        f"formato não reconhecido: {raw!r} "
+        "(use 'DD/MM/AAAA HH:MM:SS' ou só 'HH:MM:SS')"
+    )
 
 
 def discover_files_in_directory(directory: str):
@@ -211,8 +276,10 @@ def backup_file_path(file_path: str) -> str:
     return file_path + "_original"
 
 
-def shift_exif_metadata(file_path: str, hours: int, keep_backup: bool):
-    """Desloca as tags de data/hora EXIF/QuickTime de um arquivo.
+def shift_exif_metadata(file_path: str, delta: timedelta, keep_backup: bool):
+    """Desloca as tags de data/hora EXIF/QuickTime de um arquivo pelo
+    `delta` informado (pode ter qualquer precisão: dias, horas,
+    minutos, segundos).
 
     O backup é feito por NÓS (não pelo exiftool) antes de cada chamada,
     sempre sobrescrevendo o `_original` anterior. Isso é proposital: o
@@ -231,7 +298,7 @@ def shift_exif_metadata(file_path: str, hours: int, keep_backup: bool):
         except OSError as exc:
             return False, f"Falha ao criar backup: {exc}"
 
-    shift_expr = build_exiftool_shift_expr(hours)
+    shift_expr = build_exiftool_shift_expr(delta)
 
     # Sempre usamos -overwrite_original: o backup (quando pedido) já
     # foi feito acima, então não precisamos do backup automático do
@@ -293,16 +360,16 @@ def sync_filesystem_dates_to(file_path: str, target_dt: datetime, has_setfile: b
     subprocess.run(["SetFile", "-d", formatted, file_path], capture_output=True, text=True)
 
 
-def shift_filesystem_dates_relative(file_path: str, hours: int, has_setfile: bool):
+def shift_filesystem_dates_relative(file_path: str, delta: timedelta, has_setfile: bool):
     """Fallback: desloca mtime/atime/birthtime relativamente ao que já
-    estava no disco. Só é usado quando o arquivo não tem nenhuma tag
-    de data EXIF/QuickTime legível (sync_filesystem_dates_to não pode
-    ser usada nesse caso, pois não há data de referência confiável).
+    estava no disco, pelo `delta` informado. Só é usado quando o
+    arquivo não tem nenhuma tag de data EXIF/QuickTime legível
+    (sync_filesystem_dates_to não pode ser usada nesse caso, pois não
+    há data de referência confiável).
     """
     flush_pending_writes(file_path)
 
     stat = os.stat(file_path)
-    delta = timedelta(hours=hours)
 
     new_mtime = datetime.fromtimestamp(stat.st_mtime) + delta
     new_atime = datetime.fromtimestamp(stat.st_atime) + delta
@@ -359,19 +426,34 @@ def print_main_menu():
     print("\nO que deseja fazer?\n")
     print("  1 - Alterar DATA  (ajusta por dias, ex: +1, -3)")
     print("  2 - Alterar HORA  (ajusta por horas, ex: +3, -5)")
+    print("  3 - Definir data/hora exata (digite o valor certo)")
     print("  0 - Sair")
 
 
-def ask_offset(option: dict) -> int:
-    """Pergunta o valor de ajuste (dias ou horas, conforme a opção)
-    e retorna já convertido para o total de HORAS, unidade usada
-    internamente pelo exiftool e pelo ajuste do sistema de arquivos.
+def ask_offset(option: dict):
+    """Pergunta o valor de ajuste (dias ou horas, conforme a opção) e
+    retorna (valor digitado, timedelta equivalente) — o timedelta é a
+    unidade usada internamente pelo exiftool e pelo ajuste do sistema
+    de arquivos.
     """
     while True:
         raw = input(f"\n{option['pergunta']} ({option['exemplos']})? ")
         try:
             value = parse_signed_int_offset(raw)
-            return value, value * option["multiplicador"]
+            return value, timedelta(hours=value * option["multiplicador"])
+        except ValueError as exc:
+            print(f"  Entrada inválida ({exc}). Tente novamente.")
+
+
+def ask_target_datetime(reference_dt: datetime) -> datetime:
+    while True:
+        raw = input(
+            "\nQual é a data/hora CERTA desse arquivo?\n"
+            "  'DD/MM/AAAA HH:MM:SS' (data e hora), ou\n"
+            "  'HH:MM:SS' (só a hora, mantém a mesma data)\n> "
+        )
+        try:
+            return parse_target_datetime(raw, reference_dt)
         except ValueError as exc:
             print(f"  Entrada inválida ({exc}). Tente novamente.")
 
@@ -435,10 +517,9 @@ def log_line(prefix: str, msg: str):
         print(line)
 
 
-def process_files(files, total_hours, dry_run, keep_backup, has_setfile):
+def process_files(files, delta: timedelta, dry_run, keep_backup, has_setfile):
     success, errors, no_exif_date = 0, [], []
     iterator = tqdm(files, unit="arquivo") if HAS_TQDM else files
-    delta = timedelta(hours=total_hours)
 
     for f in iterator:
         # Lê a data ORIGINAL antes de alterar nada — é a referência
@@ -453,7 +534,7 @@ def process_files(files, total_hours, dry_run, keep_backup, has_setfile):
             success += 1
             continue
 
-        ok, msg = shift_exif_metadata(f, total_hours, keep_backup)
+        ok, msg = shift_exif_metadata(f, delta, keep_backup)
         if not ok:
             errors.append((f, msg))
             log_line("✗", f"{f}: {msg}")
@@ -464,7 +545,7 @@ def process_files(files, total_hours, dry_run, keep_backup, has_setfile):
         else:
             # Sem nenhuma tag de data legível: não há referência
             # confiável, então só deslocamos o que já estava no disco.
-            shift_filesystem_dates_relative(f, total_hours, has_setfile)
+            shift_filesystem_dates_relative(f, delta, has_setfile)
             no_exif_date.append(f)
 
         success += 1
@@ -492,7 +573,7 @@ def run_shift_flow(option_key: str, has_setfile: bool):
     option = MENU_OPTIONS[option_key]
     print_header(option["titulo"])
 
-    value, total_hours = ask_offset(option)
+    value, delta = ask_offset(option)
     files = ask_target_files()
 
     if not files:
@@ -505,7 +586,7 @@ def run_shift_flow(option_key: str, has_setfile: bool):
     keep_backup = confirm("Manter backups dos arquivos originais (recomendado)?", default_yes=True)
 
     print("\nResumo da operação:")
-    print(f"  Ajuste: {value:+d} {option['unidade']} (total: {total_hours:+d} horas)")
+    print(f"  Ajuste: {value:+d} {option['unidade']} (total: {format_timedelta(delta)})")
     print(f"  Arquivos: {len(files)}")
     print(f"  Modo: {'SIMULAÇÃO (nada será alterado)' if dry_run else 'APLICAR ALTERAÇÕES'}")
     print(f"  Backups: {'sim' if keep_backup else 'NÃO (sobrescreve o original)'}")
@@ -514,7 +595,70 @@ def run_shift_flow(option_key: str, has_setfile: bool):
         print("Operação cancelada.")
         return
 
-    process_files(files, total_hours, dry_run, keep_backup, has_setfile)
+    process_files(files, delta, dry_run, keep_backup, has_setfile)
+
+
+def run_set_exact_datetime_flow(has_setfile: bool):
+    """Fluxo da opção 3: o usuário digita a data/hora CERTA de um
+    arquivo de referência, e o programa calcula o deslocamento
+    automaticamente (em vez de pedir pra fazer a conta manualmente).
+
+    Quando mais de um arquivo é selecionado, o MESMO deslocamento
+    calculado a partir do arquivo de referência (o primeiro da lista)
+    é aplicado a todos — preservando a diferença de tempo entre eles,
+    em vez de definir a mesma data/hora para todo mundo.
+    """
+    print_header("Definir data/hora exata")
+
+    files = ask_target_files()
+    if not files:
+        print("\nNenhum arquivo de mídia suportado foi encontrado.")
+        return
+
+    print_summary(files)
+
+    reference_file = files[0]
+    reference_dt = read_primary_datetime(reference_file)
+    if reference_dt is None:
+        print(
+            f"\nNão consegui ler nenhuma data EXIF/QuickTime de "
+            f"'{reference_file}' pra usar como referência. Escolha um "
+            "arquivo com metadados de data legíveis."
+        )
+        return
+
+    print(f"\nArquivo de referência: {reference_file}")
+    print(f"Data/hora atual desse arquivo: {reference_dt.strftime('%d/%m/%Y %H:%M:%S')}")
+
+    target_dt = ask_target_datetime(reference_dt)
+    delta = target_dt - reference_dt
+
+    if delta.total_seconds() == 0:
+        print("\nA data já está correta — nada para ajustar.")
+        return
+
+    print(f"\nAjuste calculado: {format_timedelta(delta)}")
+    if len(files) > 1:
+        print(
+            f"Esse mesmo ajuste será aplicado aos outros {len(files) - 1} "
+            "arquivo(s) selecionado(s), preservando a diferença de tempo "
+            "entre eles (não define a mesma data/hora pra todos)."
+        )
+
+    dry_run = confirm("\nExecutar em modo simulação (não altera nada)?", default_yes=False)
+    keep_backup = confirm("Manter backups dos arquivos originais (recomendado)?", default_yes=True)
+
+    print("\nResumo da operação:")
+    print(f"  Ajuste calculado: {format_timedelta(delta)}")
+    print(f"  Arquivos: {len(files)}")
+    print(f"  Modo: {'SIMULAÇÃO (nada será alterado)' if dry_run else 'APLICAR ALTERAÇÕES'}")
+    print(f"  Backups: {'sim' if keep_backup else 'NÃO (sobrescreve o original)'}")
+
+    if not confirm("\nConfirma a operação?", default_yes=False):
+        print("Operação cancelada.")
+        return
+
+    process_files(files, delta, dry_run, keep_backup, has_setfile)
 
 
 def startup_checks() -> bool:
@@ -546,8 +690,11 @@ def run():
         elif choice in MENU_OPTIONS:
             run_shift_flow(choice, has_setfile)
             input("\nPressione ENTER para voltar ao menu...")
+        elif choice == "3":
+            run_set_exact_datetime_flow(has_setfile)
+            input("\nPressione ENTER para voltar ao menu...")
         else:
-            print("\nOpção inválida. Escolha 1, 2 ou 0.")
+            print("\nOpção inválida. Escolha 1, 2, 3 ou 0.")
 
 
 if __name__ == "__main__":

@@ -20,20 +20,21 @@ O programa é deliberadamente um único arquivo Python, dividido em três
 camadas:
 
 1. **Funções puras** (`parse_signed_int_offset`, `build_exiftool_shift_expr`,
-   `parse_exiftool_datetime`, `format_shift_line`,
-   `discover_files_in_directory`, `resolve_specific_files`,
-   `summarize_extensions`) — sem efeitos colaterais, fáceis de testar
-   isoladamente com `pytest`.
+   `format_timedelta`, `parse_exiftool_datetime`, `parse_target_datetime`,
+   `format_shift_line`, `discover_files_in_directory`,
+   `resolve_specific_files`, `summarize_extensions`) — sem efeitos
+   colaterais, fáceis de testar isoladamente com `pytest`.
 2. **Funções de I/O / efeito colateral** (`read_primary_datetime`,
    `backup_file_path`, `shift_exif_metadata`, `flush_pending_writes`,
    `sync_filesystem_dates_to`, `shift_filesystem_dates_relative`) —
    dependem de processos externos (`exiftool`, `SetFile`) e do sistema
    de arquivos.
 3. **Camada de menu/interação** (`run`, `run_shift_flow`,
-   `ask_offset`, `ask_target_files`, `process_files`) — o loop principal
-   apresenta um menu (`1` Alterar DATA, `2` Alterar HORA, `0` Sair) e
-   delega para `run_shift_flow`, que reaproveita a mesma engine de shift
-   tanto para dias quanto para horas.
+   `run_set_exact_datetime_flow`, `ask_offset`, `ask_target_datetime`,
+   `ask_target_files`, `process_files`) — o loop principal apresenta um
+   menu (`1` Alterar DATA, `2` Alterar HORA, `3` Definir data/hora
+   exata, `0` Sair) e delega para o fluxo correspondente, todos
+   reaproveitando a mesma engine de shift.
 
 Essa separação permite testar toda a lógica de parsing e descoberta de
 arquivos sem precisar de um Mac real ou do `exiftool` instalado (por isso
@@ -41,12 +42,37 @@ os testes rodam normalmente em CI Linux). As funções de I/O são testadas
 com `unittest.mock.patch`, simulando o retorno do `exiftool` sem precisar
 do binário real.
 
-### Menu: "Alterar DATA" vs. "Alterar HORA"
+### A engine interna trabalha em `timedelta`, não em "horas inteiras"
 
-Internamente, o motor de shift sempre trabalha em **horas totais** — é a
-unidade nativa tanto do `exiftool` quanto de `datetime.timedelta`. O
-dicionário `MENU_OPTIONS` define, para cada opção de menu, um
-multiplicador que converte a entrada do usuário para essa unidade comum:
+Inicialmente o motor de shift só aceitava um número inteiro de horas.
+Isso mudou quando a opção 3 ("Definir data/hora exata") foi adicionada:
+o deslocamento ali é calculado como `data_certa - data_atual_do_arquivo`,
+que raramente cai num número redondo de horas (ex: `4:28:29`). Por isso
+toda a engine — `shift_exif_metadata`, `sync_filesystem_dates_to`,
+`shift_filesystem_dates_relative`, `process_files` — foi generalizada
+para trabalhar com `datetime.timedelta` (dias/horas/minutos/segundos)
+do início ao fim, em vez de um `int` de horas.
+
+`build_exiftool_shift_expr(delta)` converte esse timedelta para o
+formato que o exiftool espera:
+
+```python
+def build_exiftool_shift_expr(delta: timedelta) -> str:
+    sign = "+" if delta.total_seconds() >= 0 else "-"
+    total_seconds = abs(int(delta.total_seconds()))
+    days, remainder = divmod(total_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{sign}=0:0:{days} {hours}:{minutes}:{seconds}"
+```
+
+E `format_timedelta(delta)` formata o mesmo valor de forma legível para
+o usuário (ex: `+4h 28min 29s`, `+1d 3h`), omitindo componentes zerados.
+
+### Opções 1/2 ("Alterar DATA"/"Alterar HORA"): deslocamento relativo
+
+`MENU_OPTIONS` define, para cada uma dessas duas opções, um
+multiplicador que converte a entrada do usuário num `timedelta`:
 
 ```python
 MENU_OPTIONS = {
@@ -55,11 +81,43 @@ MENU_OPTIONS = {
 }
 ```
 
-Ou seja, `1 - Alterar DATA` com entrada `+2` vira `2 * 24 = 48` horas
-internamente; `2 - Alterar HORA` com entrada `-5` permanece `-5` horas.
-Isso evita duplicar a lógica de shift — a única diferença entre as duas
-opções de menu é a unidade que o usuário enxerga e o multiplicador
-aplicado antes de chamar a mesma engine.
+`ask_offset()` retorna `(valor_digitado, timedelta(hours=valor*multiplicador))`.
+Ou seja, `1 - Alterar DATA` com entrada `+2` vira `timedelta(days=2)`;
+`2 - Alterar HORA` com entrada `-5` vira `timedelta(hours=-5)`. Essas
+duas opções nunca produzem minutos/segundos — só existem para dar uma
+unidade mais natural (dias vs. horas) à mesma operação de deslocamento
+relativo.
+
+### Opção 3 ("Definir data/hora exata"): deslocamento calculado, com precisão de segundos
+
+Pensada para o caso em que o usuário **já sabe** a data/hora certa de um
+arquivo (ex: comparando com outra foto/vídeo de referência) e não quer
+fazer a conta de cabeça. Implementada em `run_set_exact_datetime_flow`:
+
+1. Pede os arquivos (mesmo fluxo de `ask_target_files`).
+2. Usa o **primeiro arquivo da lista ordenada** como referência, lê sua
+   data atual via `read_primary_datetime` (se não houver data legível,
+   cancela com uma mensagem clara — não há como calcular sem isso).
+3. Pede a data/hora certa via `ask_target_datetime`, que usa
+   `parse_target_datetime` para interpretar:
+   - `DD/MM/AAAA HH:MM:SS` (ou sem segundos) — data E hora completas;
+   - só `HH:MM:SS` (ou `HH:MM`) — mantém a **data** do arquivo de
+     referência, troca só a hora (`datetime.combine(reference.date(), time)`).
+4. Calcula `delta = data_certa - data_atual_da_referência` (um
+   `timedelta` com precisão de segundos).
+5. Aplica esse **mesmo delta** a TODOS os arquivos selecionados via
+   `process_files(files, delta, ...)` — preservando a diferença de
+   tempo relativa entre eles. Importante: a opção 3 **não define a
+   mesma data/hora para todo mundo**; ela calcula um deslocamento a
+   partir de um arquivo e aplica esse deslocamento aos demais, exatamente
+   como as opções 1/2 fazem — só que o valor do deslocamento é
+   *calculado* em vez de digitado diretamente.
+
+Esse comportamento foi validado com um teste de integração real
+(exiftool/ffmpeg instalados num ambiente de teste, dois vídeos com
+horários diferentes): ao informar a hora certa do primeiro vídeo
+(referência), o segundo vídeo recebeu o mesmo deslocamento, preservando
+exatamente a diferença de tempo original entre os dois (7min29s).
 
 ## Por que `exiftool` e não uma lib Python pura?
 
@@ -85,17 +143,27 @@ O `exiftool` espera o deslocamento no formato:
 [+-]=Y:M:D H:M:S
 ```
 
-O programa sempre fixa a parte `Y:M:D` em `0:0:0` e usa apenas a parte
-`H:M:S`, por exemplo, para `+27` horas:
+O programa sempre fixa a parte `Y:M` (ano/mês) em `0:0` e deriva `D
+H:M:S` diretamente do `timedelta` calculado, via `build_exiftool_shift_expr`.
+Por exemplo, para `timedelta(hours=27)` (que o Python já normaliza
+internamente para 1 dia + 3 horas):
 
 ```
--AllDates+=0:0:0 27:0:0
+-AllDates+=0:0:1 3:0:0
 ```
 
-O `exiftool` resolve internamente o "carry" de horas para dias (e, se
-necessário, meses/anos) ao recalcular a data — por isso um valor como
-`+27` corrige tanto a **hora** quanto a **data**, sem precisar de um
-campo separado para dias.
+E para um deslocamento com precisão de segundos, como os calculados
+pela opção 3 ("Definir data/hora exata"), por exemplo
+`timedelta(hours=4, minutes=28, seconds=29)`:
+
+```
+-AllDates+=0:0:0 4:28:29
+```
+
+O `exiftool` resolve internamente qualquer "carry" adicional (de horas
+para dias, ou de dias para meses/anos) ao recalcular a data — por isso
+um deslocamento grande corrige tanto a **hora** quanto a **data**, sem
+precisar de lógica extra da nossa parte.
 
 ### Tags afetadas
 
